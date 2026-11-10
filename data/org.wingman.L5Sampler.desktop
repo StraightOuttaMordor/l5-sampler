@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Sampler
+Comment=Record, trim and sequence sounds. Works offline.
+Exec=l5-sampler
+Icon=org.wingman.L5Sampler
+Terminal=false
+Categories=AudioVideo;Audio;Music;
+StartupNotify=true
+X-Purism-FormFactor=Workstation;Mobile;
