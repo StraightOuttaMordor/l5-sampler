@@ -1,9 +1,12 @@
 """On-device storage. Everything lives under ~/.local/share/l5-sampler/.
 
-sounds/<id>.wav   full recording (48 kHz, 16-bit mono); trim/vol/pitch are metadata
-library.json      {id: {name, start, end, vol, pitch, created}}
+sounds/<id>.wav   full recording / sample (48 kHz, 16-bit mono); trim/vol/pitch are metadata
+library.json      {id: {name, folder, kind, bpm, peaks, start, end, vol, pitch, created}}
 beats.json        [beat, ...]
 state.json        {draft, dirty, pads}
+
+Audio is loaded lazily (load_data) so a library of thousands of samples
+costs only its metadata at startup.
 """
 import json
 import os
@@ -13,6 +16,8 @@ import uuid
 from .engine import read_wav, write_wav
 
 BASE = os.path.expanduser(os.environ.get('L5S_HOME', '~/.local/share/l5-sampler'))
+META_KEYS = ('name', 'folder', 'kind', 'bpm', 'peaks', 'start', 'end', 'vol', 'pitch', 'created')
+DEFAULTS = {'folder': 'My recordings', 'kind': 'hit', 'bpm': None, 'peaks': None}
 
 
 def _atomic_write(path, text):
@@ -49,37 +54,41 @@ class Store(object):
     def fresh(self):
         return not os.path.exists(self.lib_path)
 
-    # ---- sounds
+    def wav_path(self, sid):
+        return os.path.join(self.sdir, sid + '.wav')
+
+    # ---- sounds (metadata only; audio via load_data)
     def load_sounds(self):
         meta = _read_json(self.lib_path, {})
         sounds = {}
         for sid, m in meta.items():
-            p = os.path.join(self.sdir, sid + '.wav')
-            if not os.path.exists(p):
+            if not os.path.exists(self.wav_path(sid)):
                 continue
-            try:
-                m = dict(m)
-                m['id'] = sid
-                m['data'] = read_wav(p)
-                sounds[sid] = m
-            except Exception:
-                continue
+            s = dict(DEFAULTS)
+            s.update(m)
+            s['id'] = sid
+            s['data'] = None
+            s['buf'] = None
+            sounds[sid] = s
         return sounds
+
+    def load_data(self, sid):
+        return read_wav(self.wav_path(sid))
 
     def _write_lib(self, sounds):
         meta = {}
         for sid, s in sounds.items():
-            meta[sid] = {k: s[k] for k in ('name', 'start', 'end', 'vol', 'pitch', 'created')}
-        _atomic_write(self.lib_path, json.dumps(meta, indent=1))
+            meta[sid] = {k: s.get(k, DEFAULTS.get(k)) for k in META_KEYS}
+        _atomic_write(self.lib_path, json.dumps(meta, separators=(',', ':')))
 
     def save_sound(self, sounds, s, write_audio):
         if write_audio:
-            write_wav(os.path.join(self.sdir, s['id'] + '.wav'), s['data'])
+            write_wav(self.wav_path(s['id']), s['data'])
         self._write_lib(sounds)
 
     def delete_sound(self, sounds, sid):
         try:
-            os.remove(os.path.join(self.sdir, sid + '.wav'))
+            os.remove(self.wav_path(sid))
         except OSError:
             pass
         self._write_lib(sounds)

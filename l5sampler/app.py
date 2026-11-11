@@ -55,6 +55,18 @@ button.b:disabled { opacity: 0.55; }
 .chip { background: #f7f5f0; border-radius: 12px; padding: 6px 10px 6px 8px; min-width: 76px; }
 .chip.sel { background: #141414; color: #fff; }
 .chip .n { font-weight: 800; font-size: 13px; }
+.chip.loop .n { font-style: italic; }
+.chip.muted { opacity: 0.45; }
+.loopcard { background: #f7f5f0; border-radius: 14px; padding: 14px; }
+.loopcard .big { font-size: 20px; font-weight: 800; }
+.loopcard button.b { background: #141414; color: #fff; }
+.loopcard button.b.dark { background: #ff5a1f; }
+.folder { background: #f7f5f0; border-radius: 12px; padding: 10px 12px; min-height: 52px; }
+.folder .fn { font-weight: 800; }
+.crumb { font-weight: 800; font-size: 16px; }
+button.back { background: #f7f5f0; background-image: none; box-shadow: none; border: none; border-radius: 10px; min-height: 38px; font-weight: 800; padding: 0 12px; }
+.tag { font-size: 10px; font-weight: 800; letter-spacing: 1px; color: #6f6a61; border: 1.5px solid #d3cec4; border-radius: 6px; padding: 0 5px; }
+.lrow-front.sel .tag { color: #ddd; border-color: #555; }
 .chip.add { background: transparent; border: 1.5px dashed #d3cec4; color: #6f6a61; font-weight: 800; padding: 0 12px; }
 .strip { min-width: 4px; border-radius: 2px; }
 .cell { background: #f7f5f0; border-radius: 12px; }
@@ -87,7 +99,7 @@ button.edit { background: transparent; background-image: none; box-shadow: none;
   min-height: 50px; font-weight: 800; font-size: 14px; letter-spacing: 1px; color: #6f6a61; border-top: 3px solid transparent; }
 .tabbar button.on { color: #141414; border-top: 3px solid #ff5a1f; }
 .scrim { background: rgba(0,0,0,0.35); }
-.sheet { background: #ebe8e1; border-radius: 18px 18px 0 0; padding: 12px 14px 22px 14px; }
+.sheet { background: #ebe8e1; border-radius: 18px 18px 0 0; padding: 12px 14px 28px 14px; }
 .sheet .title { font-size: 18px; font-weight: 800; }
 .shitem { background: #f7f5f0; border-radius: 12px; padding: 6px 6px 6px 12px; min-height: 50px; }
 .shitem.cur { box-shadow: inset 0 0 0 2px #ff5a1f; }
@@ -146,6 +158,34 @@ def on_press(widget, cb, release=None):
     return g
 
 
+def on_tap_or_hold(widget, tap, hold, hold_s=0.45):
+    """Tap fires on touch-DOWN (instant, like a pad); holding past hold_s also fires `hold`.
+
+    The tap is undone by the caller if a hold follows (see tap_cell/hold_cell)."""
+    st = {'src': None}
+
+    def cancel():
+        if st['src']:
+            GLib.source_remove(st['src'])
+            st['src'] = None
+
+    def fire():
+        st['src'] = None
+        hold()
+        return False
+
+    def pressed(g, n, x, y):
+        cancel()
+        tap()
+        st['src'] = GLib.timeout_add(int(hold_s * 1000), fire)
+    g = Gtk.GestureClick()
+    g.connect('pressed', pressed)
+    g.connect('released', lambda g, n, x, y: cancel())
+    g.connect('stopped', lambda g: cancel())
+    widget.add_controller(g)
+    return g
+
+
 def fmt_s(s):
     return ('%.2f s' % s) if s < 10 else ('%.1f s' % s)
 
@@ -156,7 +196,9 @@ def new_beat():
 
 class SamplerApp(Adw.Application):
     def __init__(self):
-        super().__init__(application_id='org.wingman.L5Sampler', flags=Gio.ApplicationFlags.FLAGS_NONE)
+        # a test instance (L5S_CTL set) must not hand off to the copy the user has open: GTK apps are single-instance
+        app_id = 'org.wingman.L5Sampler' + ('.Test' if os.environ.get('L5S_CTL') else '')
+        super().__init__(application_id=app_id, flags=Gio.ApplicationFlags.FLAGS_NONE)
         self.win = None
         self.connect('activate', self.on_activate)
         self.connect('shutdown', self.on_shutdown)
@@ -166,9 +208,8 @@ class SamplerApp(Adw.Application):
         self.store = Store()
         if self.store.fresh:
             self.seed()
-        self.sounds = self.store.load_sounds()
-        for s in self.sounds.values():
-            self.prep(s)
+        self.sounds = self.store.load_sounds()     # metadata only; audio loads on first use
+        self._lcache = {}                           # loop buffers stretched to the beat tempo
         st = self.store.load_state()
         self.beat = st.get('draft') or new_beat()
         self.dirty = bool(st.get('dirty', False))
@@ -179,6 +220,8 @@ class SamplerApp(Adw.Application):
         self.sel = 0
         self.tab = 'beat'
         self.lib_sel = None
+        self.lib_folder = None
+        self.sheet_ctx = None
         self.playing = False
         self.cur_step = -1
         self.ed = self.empty_ed()
@@ -206,25 +249,51 @@ class SamplerApp(Adw.Application):
         for k, (name, data) in enumerate(starter_kit()):
             sid = new_id()
             s = {'id': sid, 'name': name, 'data': data, 'start': 0.0, 'end': len(data) / E.SR,
-                 'vol': 1.0, 'pitch': 0, 'created': time.time() - (10 - k)}
+                 'vol': 1.0, 'pitch': 0, 'created': time.time() - (10 - k), 'folder': 'Starter kit',
+                 'kind': 'hit', 'bpm': None, 'peaks': self.mk_peaks(data)}
             sounds[sid] = s
             self.store.save_sound(sounds, s, True)
             ids.append(sid)
+        # first launch opens on an EMPTY beat (no background pattern); the kit sits on the pads
+        self.store.save_state({'draft': new_beat(), 'dirty': False, 'pads': ids[:4]})
 
-        def st(idx):
-            a = [0] * 16
-            for i in idx:
-                a[i] = 1
-            return a
-        beat = new_beat()
-        beat['name'] = 'Starter beat'
-        beat['rows'] = [{'soundId': ids[0], 'steps': st([0, 8, 10])},
-                        {'soundId': ids[1], 'steps': st([4, 12])},
-                        {'soundId': ids[2], 'steps': st([0, 2, 4, 6, 8, 10, 12, 14])}]
-        self.store.save_state({'draft': beat, 'dirty': True, 'pads': ids[:4]})
+    @staticmethod
+    def mk_peaks(data, n=56):
+        pk = E.peaks(data, n)
+        top = float(pk.max()) or 1.0
+        return [round(float(v) / top, 3) for v in pk]
+
+    def ensure(self, s):
+        """Load audio + build the one-shot buffer on first use."""
+        if s.get('data') is None:
+            s['data'] = self.store.load_data(s['id'])
+        if s.get('buf') is None:
+            self.prep(s)
+        return s
 
     def prep(self, s):
         s['buf'] = E.render_sound(s['data'], s['start'], s['end'], s['pitch'])
+        for k in [k for k in self._lcache if k[0] == s['id']]:
+            del self._lcache[k]
+
+    def is_loop(self, s):
+        return s.get('kind') == 'loop'
+
+    def loop_steps(self, s):
+        """Length of a loop in 16ths, from its trimmed length at its native tempo."""
+        bpm = s.get('bpm') or self.beat['bpm']
+        return E.loop_bars(s['end'] - s['start'], bpm) * 16
+
+    def loop_buf(self, s):
+        self.ensure(s)
+        n = self.loop_steps(s)
+        key = (s['id'], self.beat['bpm'], n, s['start'], s['end'])
+        b = self._lcache.get(key)
+        if b is None:
+            b = E.render_loop(s['data'], s['start'], s['end'], n, self.beat['bpm'])
+            self._lcache = {k: v for k, v in self._lcache.items() if k[0] != s['id']}
+            self._lcache[key] = b
+        return b, n
 
     def steps(self):
         return 12 if self.beat['meter'] == 3 else 16
@@ -235,12 +304,19 @@ class SamplerApp(Adw.Application):
 
     def push_pattern(self):
         n = self.steps()
-        rows = []
+        rows, loops = [], []
         for r in self.beat['rows']:
             s = self.sounds.get(r['soundId'])
-            if s:
+            if not s:
+                continue
+            if r.get('loop'):
+                if not r.get('mute'):
+                    buf, ln = self.loop_buf(s)
+                    loops.append((s['id'], buf, float(s['vol']), ln))
+            elif any(r['steps'][:n]):
+                self.ensure(s)
                 rows.append((s['buf'], float(s['vol']), tuple(r['steps'][:n])))
-        self.engine.pattern = E.Pattern(self.beat['bpm'], float(self.beat['swing']), n, rows)
+        self.engine.pattern = E.Pattern(self.beat['bpm'], float(self.beat['swing']), n, rows, loops)
 
     def persist(self):
         if self._save_src:
@@ -260,10 +336,19 @@ class SamplerApp(Adw.Application):
     def sound_len(self, s):
         return (s['end'] - s['start']) / (2.0 ** (s['pitch'] / 12.0))
 
-    def play_sound(self, sid):
+    def play_sound(self, sid, tag=None):
+        """One-shot. Loops always choke (re-tap restarts, never stacks 8 s loops)."""
         s = self.sounds.get(sid)
-        if s:
-            self.engine.play(s['buf'], float(s['vol']), tag='one:' + sid)
+        if not s:
+            return
+        self.ensure(s)
+        if self.is_loop(s):
+            self.engine.play(s['buf'], float(s['vol']), tag=tag or 'preview-lib', choke=True)
+        else:
+            self.engine.play(s['buf'], float(s['vol']), tag=tag or ('one:' + sid))
+
+    def stop_previews(self):
+        self.engine.stop_tag('preview-lib')
 
     # ================================================================ build UI
     def on_activate(self, app):
@@ -386,7 +471,11 @@ class SamplerApp(Adw.Application):
         self.grid.set_vexpand(True)
         self.cells = []
         self.cells_n = 0
-        page.append(self.grid)
+        self.grid_stack = Gtk.Stack()
+        self.grid_stack.set_vexpand(True)
+        self.grid_stack.add_named(self.grid, 'grid')
+        self.grid_stack.add_named(self.build_loopcard(), 'loop')
+        page.append(self.grid_stack)
 
         bot = hbox(6)
         self.clear_btn = button('Clear', 'ghost', cb=self.clear_row)
@@ -497,6 +586,10 @@ class SamplerApp(Adw.Application):
             chip = hbox(8, 'chip')
             if i == self.sel:
                 chip.add_css_class('sel')
+            if r.get('loop'):
+                chip.add_css_class('loop')
+                if r.get('mute'):
+                    chip.add_css_class('muted')
             strip = Gtk.Box()
             strip.add_css_class('strip')
             strip.add_css_class('c%d' % (i % len(COLORS)))
@@ -506,10 +599,15 @@ class SamplerApp(Adw.Application):
             nl = label(s['name'], 'n', xalign=0, ellipsize=True)
             nl.set_max_width_chars(12)
             col.append(nl)
-            dots = Gtk.DrawingArea()
-            dots.set_size_request(n * 5 + 9, 6)
-            dots.set_draw_func(self.draw_dots, (i, n))
-            col.append(dots)
+            if r.get('loop'):
+                bars = self.loop_steps(s) // 16
+                col.append(label('LOOP · %d bar%s%s' % (bars, '' if bars == 1 else 's', ' · muted' if r.get('mute') else ''),
+                                 'tag', xalign=0))
+            else:
+                dots = Gtk.DrawingArea()
+                dots.set_size_request(n * 5 + 9, 6)
+                dots.set_draw_func(self.draw_dots, (i, n))
+                col.append(dots)
             chip.append(col)
             on_press(chip, lambda i=i: self.select_row(i))
             self.chips.append(chip)
@@ -519,7 +617,8 @@ class SamplerApp(Adw.Application):
         on_press(add, self.open_add_sound)
         self.chips.append(add)
         has = bool(self.beat['rows'])
-        self.clear_btn.set_sensitive(has)
+        cur = self.beat['rows'][self.sel] if has else None
+        self.clear_btn.set_sensitive(bool(cur) and not cur.get('loop'))
         self.remove_btn.set_sensitive(has)
 
     def draw_dots(self, area, cr, w, h, data):
@@ -551,25 +650,73 @@ class SamplerApp(Adw.Application):
         if not self.playing:
             self.play_sound(self.beat['rows'][i]['soundId'])
 
+    # ---- loop rows
+    def build_loopcard(self):
+        card = vbox(10, 'loopcard')
+        card.set_valign(Gtk.Align.START)
+        self.lc_name = label('', 'big', xalign=0, ellipsize=True)
+        self.lc_info = label('', 'dim', xalign=0, wrap=True)
+        card.append(self.lc_name)
+        card.append(self.lc_info)
+        r = hbox(8)
+        self.lc_mute = button('Mute loop', cb=self.toggle_loop_mute)
+        self.lc_mute.set_hexpand(True)
+        r.append(self.lc_mute)
+        card.append(r)
+        card.append(label('Loops play the whole time the beat runs, locked to its tempo. '
+                          'Change BPM and the loop speeds up or slows down with it.', 'dim', xalign=0, wrap=True))
+        return card
+
+    def render_loopcard(self, r):
+        s = self.sounds[r['soundId']]
+        bars = self.loop_steps(s) // 16
+        self.lc_name.set_label(s['name'])
+        orig = s.get('bpm')
+        self.lc_info.set_label('%s · %d bar%s%s' % (s.get('folder', ''), bars, '' if bars == 1 else 's',
+                                                   (' · recorded at %d BPM' % orig) if orig else ''))
+        self.lc_mute.set_label('Unmute loop' if r.get('mute') else 'Mute loop')
+        if r.get('mute'):
+            self.lc_mute.add_css_class('dark')
+        else:
+            self.lc_mute.remove_css_class('dark')
+
+    def toggle_loop_mute(self):
+        r = self.beat['rows'][self.sel]
+        r['mute'] = not r.get('mute')
+        self.beat_changed()
+        self.render_beat()
+
     def render_grid(self):
         n = self.steps()
         if self.cells_n != n:
             for cw in self.cells:
                 self.grid.remove(cw)
             self.cells = []
+            self.cell_dots = []
             for k in range(n):
-                cell = Gtk.Box()
-                cell.add_css_class('cell')
+                cell = vbox(0, 'cell')
                 cell.set_hexpand(True)
                 cell.set_vexpand(True)
                 lb = label(str(k // 4 + 1) if k % 4 == 0 else COUNT[k % 4], xalign=0)
                 lb.set_valign(Gtk.Align.START)
                 cell.append(lb)
-                on_press(cell, lambda k=k: self.tap_cell(k))
+                dots = Gtk.DrawingArea()
+                dots.set_vexpand(True)
+                dots.set_draw_func(self.draw_cell_dots, k)
+                cell.append(dots)
+                on_tap_or_hold(cell, lambda k=k: self.tap_cell(k), lambda k=k: self.hold_cell(k))
                 self.grid.attach(cell, k % 4, k // 4, 1, 1)
                 self.cells.append(cell)
+                self.cell_dots.append(dots)
             self.cells_n = n
         row = self.beat['rows'][self.sel] if self.beat['rows'] else None
+        if row is not None and row.get('loop'):
+            self.render_loopcard(row)
+            self.grid_stack.set_visible_child_name('loop')
+        else:
+            self.grid_stack.set_visible_child_name('grid')
+        for d in self.cell_dots:
+            d.queue_draw()
         cc = 'c%d' % (self.sel % len(COLORS))
         for k, cell in enumerate(self.cells):
             for c in ['c%d' % j for j in range(len(COLORS))] + ['on']:
@@ -581,20 +728,101 @@ class SamplerApp(Adw.Application):
                 cell.add_css_class(cc)
         self.draw_playhead()
 
+    def draw_cell_dots(self, area, cr, w, h, k):
+        """Small colored dot for every (non-loop) sound that plays on step k."""
+        dots = [i for i, r in enumerate(self.beat['rows'])
+                if not r.get('loop') and k < len(r['steps']) and r['steps'][k]]
+        if not dots:
+            return
+        rad, gap = 3.5, 3.0
+        per_row = max(1, int((w - 8) // (2 * rad + gap)))
+        for j, i in enumerate(dots):
+            col = Gdk.RGBA()
+            col.parse(COLORS[i % len(COLORS)])
+            x = 8 + rad + (j % per_row) * (2 * rad + gap)
+            y = h - 8 - rad - (j // per_row) * (2 * rad + gap)
+            # ring in ink when the dot is the selected row's colour on its own filled cell
+            cr.set_source_rgba(1, 1, 1, 0.95)
+            cr.arc(x, y, rad + 1.5, 0, 6.3)
+            cr.fill()
+            cr.set_source_rgba(col.red, col.green, col.blue, 1)
+            cr.arc(x, y, rad, 0, 6.3)
+            cr.fill()
+
+    def hit_rows(self):
+        return [i for i, r in enumerate(self.beat['rows']) if not r.get('loop')]
+
     def tap_cell(self, k):
+        self._last_tap = None
         if not self.beat['rows']:
             self.open_add_sound()
             return
         r = self.beat['rows'][self.sel]
+        if r.get('loop'):
+            return
+        self._last_tap = (self.sel, k, r['steps'][k])
         r['steps'][k] = 0 if r['steps'][k] else 1
         if r['steps'][k] and not self.playing:
             self.play_sound(r['soundId'])
         self.beat_changed()
         self.render_grid()
-        for chip in getattr(self, 'chip_widgets', []):
-            pass
         self.render_chips()
         self.render_beat_top()
+
+    def hold_cell(self, k):
+        """Long-press: undo the tap that started the press, then edit everything on this step."""
+        lt = getattr(self, '_last_tap', None)
+        if lt and lt[1] == k and lt[0] < len(self.beat['rows']):
+            self.beat['rows'][lt[0]]['steps'][k] = lt[2]
+            self.beat_changed()
+            self.render_grid()
+            self.render_chips()
+        self._last_tap = None
+        self.open_step_sheet(k)
+
+    def step_name(self, k):
+        return 'Beat %d · %s' % (k // 4 + 1, str(k // 4 + 1) if k % 4 == 0 else COUNT[k % 4])
+
+    def open_step_sheet(self, k):
+        body = vbox(6)
+        body.append(label('Tap a sound to switch it on or off for this step. Changes play right away.',
+                          'dim', xalign=0, wrap=True))
+        rows = self.hit_rows()
+        if not rows:
+            body.append(label('No step sounds in this beat yet.', 'dim', xalign=0))
+        for i in rows:
+            r = self.beat['rows'][i]
+            s = self.sounds[r['soundId']]
+            on = bool(r['steps'][k])
+            it = hbox(10, 'shitem')
+            dot = Gtk.Box()
+            dot.add_css_class('strip')
+            dot.add_css_class('c%d' % (i % len(COLORS)))
+            dot.set_size_request(6, 28)
+            it.append(dot)
+            nm = label(s['name'], 't', xalign=0, ellipsize=True)
+            nm.set_hexpand(True)
+            it.append(nm)
+            sw = Gtk.Switch()
+            sw.set_active(on)
+            sw.set_valign(Gtk.Align.CENTER)
+
+            def flip(sw_, _p, i=i):
+                rr = self.beat['rows'][i]
+                rr['steps'][k] = 1 if sw_.get_active() else 0
+                if rr['steps'][k] and not self.playing:
+                    self.play_sound(rr['soundId'])
+                self.beat_changed()
+                self.render_grid()
+                self.render_chips()
+                self.render_beat_top()
+            sw.connect('notify::active', flip)
+            it.append(sw)
+            body.append(it)
+        add = button('+  Add a sound to this step', 'ghost', cb=lambda: self.open_browser({'mode': 'step', 'k': k}))
+        add.set_margin_top(6)
+        body.append(add)
+        self.open_sheet(self.step_name(k), body)
 
     def draw_playhead(self):
         for k, cell in enumerate(self.cells):
@@ -634,7 +862,7 @@ class SamplerApp(Adw.Application):
         self.render_beat_top()
 
     def clear_row(self):
-        if not self.beat['rows']:
+        if not self.beat['rows'] or self.beat['rows'][self.sel].get('loop'):
             return
         self.beat['rows'][self.sel]['steps'] = [0] * 16
         self.beat_changed()
@@ -659,37 +887,135 @@ class SamplerApp(Adw.Application):
             go()
 
     def open_add_sound(self):
-        used = set(r['soundId'] for r in self.beat['rows'])
+        self.open_browser({'mode': 'add'})
+
+    # ---- folders (one level). Shared by the Library tab and the "pick a sound" sheets.
+    def folders(self):
+        """[(name, count, n_loops)] sorted: My recordings, Starter kit, then hits A-Z, then loop folders A-Z."""
+        agg = {}
+        for s in self.sounds.values():
+            f = s.get('folder') or 'My recordings'
+            a = agg.setdefault(f, [0, 0])
+            a[0] += 1
+            a[1] += 1 if self.is_loop(s) else 0
+        pin = {'My recordings': 0, 'Starter kit': 1}
+
+        def key(f):
+            n, l = agg[f]
+            return (pin.get(f, 2), 1 if l == n else 0, f.lower())
+        return [(f, agg[f][0], agg[f][1]) for f in sorted(agg, key=key)]
+
+    def folder_sounds(self, folder):
+        xs = [s for s in self.sounds.values() if (s.get('folder') or 'My recordings') == folder]
+        if folder == 'My recordings':
+            return sorted(xs, key=lambda s: -s['created'])
+        return sorted(xs, key=lambda s: s['name'].lower())
+
+    def folder_row(self, name, count, loops, on_tap):
+        it = hbox(10, 'folder')
+        col = vbox(1)
+        col.set_hexpand(True)
+        col.append(label(name, 'fn', xalign=0, ellipsize=True))
+        pl = lambda n, w: '%d %s%s' % (n, w, '' if n == 1 else 's')
+        what = pl(count, 'loop') if loops == count else pl(count, 'sound') if not loops else \
+            '%s · %s' % (pl(count - loops, 'sound'), pl(loops, 'loop'))
+        col.append(label(what, 'dim', xalign=0))
+        it.append(col)
+        it.append(label('›', 'crumb'))
+        on_press(it, on_tap)
+        return it
+
+    def open_browser(self, ctx, folder=None):
+        """Bottom-sheet picker. ctx['mode']: 'add' (new beat row) or 'step' (add to step k)."""
+        self.sheet_ctx = dict(ctx, folder=folder)
         body = vbox(6)
-        allx = sorted(self.sounds.values(), key=lambda s: -s['created'])
-        if not allx:
-            body.append(label('Library is empty.', 'dim'))
-        for s in allx:
-            dis = s['id'] in used
-            it = hbox(8, 'shitem')
-            if dis:
-                it.add_css_class('dis')
-            col = vbox(2)
-            col.set_hexpand(True)
-            col.set_valign(Gtk.Align.CENTER)
-            col.append(label(s['name'], 't', xalign=0, ellipsize=True))
-            col.append(label('already in this beat' if dis else fmt_s(self.sound_len(s)), 'dim', xalign=0))
-            it.append(col)
-            if not dis:
-                on_press(it, lambda sid=s['id']: self.add_row(sid))
-            body.append(it)
-        rec = button('●  Record a new sound', 'ghost', cb=lambda: (self.close_sheet(), self.set_tab('sound')))
-        rec.set_margin_top(6)
-        body.append(rec)
-        self.open_sheet('Add a sound to the beat', body)
+        used = set(r['soundId'] for r in self.beat['rows'])
+        if folder is None:
+            if ctx['mode'] == 'add':
+                body.append(label('Sounds go on the step grid. Loops play the whole time, locked to the tempo.',
+                                  'dim', xalign=0, wrap=True))
+            for f, n, l in self.folders():
+                if ctx['mode'] == 'step' and l == n:
+                    continue                      # loops can't sit on a single step
+                body.append(self.folder_row(f, n, l, lambda f=f: self.open_browser(ctx, f)))
+            rec = button('●  Record a new sound', 'ghost', cb=lambda: (self.close_sheet(), self.set_tab('sound')))
+            rec.set_margin_top(6)
+            body.append(rec)
+            title = 'Add a sound to the beat' if ctx['mode'] == 'add' else 'Add to ' + self.step_name(ctx['k'])
+        else:
+            back = Gtk.Button(label='‹  All folders')
+            back.add_css_class('back')
+            back.set_halign(Gtk.Align.START)
+            back.connect('clicked', lambda *_: (self.stop_previews(), self.open_browser(ctx)))
+            body.append(back)
+            for s in self.folder_sounds(folder):
+                if ctx['mode'] == 'step' and self.is_loop(s):
+                    continue
+                dis = s['id'] in used and ctx['mode'] == 'add'
+                it = hbox(8, 'shitem')
+                if dis:
+                    it.add_css_class('dis')
+                col = vbox(2)
+                col.set_hexpand(True)
+                col.set_valign(Gtk.Align.CENTER)
+                col.append(label(s['name'], 't', xalign=0, ellipsize=True))
+                sub = 'already in this beat' if dis else self.sound_sub(s)
+                col.append(label(sub, 'dim', xalign=0))
+                it.append(col)
+                hear = Gtk.Button(label='▶')
+                hear.add_css_class('edit')
+                hear.set_valign(Gtk.Align.CENTER)
+                hear.connect('clicked', lambda *_, sid=s['id']: self.play_sound(sid))
+                it.append(hear)
+                if not dis:
+                    pick = Gtk.Button(label='Add')
+                    pick.add_css_class('edit')
+                    pick.set_valign(Gtk.Align.CENTER)
+                    pick.connect('clicked', lambda *_, sid=s['id']: self.browser_pick(sid))
+                    it.append(pick)
+                body.append(it)
+            title = folder
+        self.open_sheet(title, body)
+
+    def sound_sub(self, s):
+        if self.is_loop(s):
+            bars = self.loop_steps(s) // 16
+            return 'loop · %d bar%s%s' % (bars, '' if bars == 1 else 's', (' · %d BPM' % s['bpm']) if s.get('bpm') else '')
+        return fmt_s(self.sound_len(s))
+
+    def browser_pick(self, sid):
+        ctx = self.sheet_ctx or {'mode': 'add'}
+        self.stop_previews()
+        if ctx['mode'] == 'step':
+            k = ctx['k']
+            idx = next((i for i, r in enumerate(self.beat['rows']) if r['soundId'] == sid and not r.get('loop')), None)
+            if idx is None:
+                self.beat['rows'].append({'soundId': sid, 'steps': [0] * 16})
+                idx = len(self.beat['rows']) - 1
+            self.beat['rows'][idx]['steps'][k] = 1
+            self.sel = idx
+            self.beat_changed()
+            self.render_beat()
+            if not self.playing:
+                self.play_sound(sid)
+            self.open_step_sheet(k)
+            return
+        self.add_row(sid)
 
     def add_row(self, sid):
-        self.beat['rows'].append({'soundId': sid, 'steps': [0] * 16})
+        s = self.sounds[sid]
+        row = {'soundId': sid, 'steps': [0] * 16}
+        if self.is_loop(s):
+            row['loop'] = True
+            if not self.beat['rows'] and s.get('bpm'):
+                self.beat['bpm'] = int(s['bpm'])      # first thing in an empty beat: adopt the loop's own tempo
+        self.beat['rows'].append(row)
         self.sel = len(self.beat['rows']) - 1
         self.beat_changed()
         self.close_sheet()
         self.render_beat()
-        self.play_sound(sid)
+        if not self.playing:
+            self.play_sound(sid)
 
     # ---- beats sheet (save / load / new / export)
     def open_beats(self):
@@ -920,7 +1246,7 @@ class SamplerApp(Adw.Application):
             ed['buf'] = E.render_sound(ed['data'], ed['start'], ed['end'], ed['pitch'])
 
     def ed_load(self, sid):
-        s = self.sounds[sid]
+        s = self.ensure(self.sounds[sid])
         self.ed_stop()
         self.ed = self.empty_ed()
         self.ed.update({'id': sid, 'data': s['data'], 'start': s['start'], 'end': s['end'], 'name': s['name'],
@@ -1195,9 +1521,12 @@ class SamplerApp(Adw.Application):
         is_new = ed['id'] is None
         sid = ed['id'] or new_id()
         name = ed['name'].strip() or 'Sound %d' % (len(self.sounds) + 1)
+        old = self.sounds.get(sid, {})
         s = {'id': sid, 'name': name, 'data': ed['data'], 'start': ed['start'], 'end': ed['end'],
              'vol': ed['vol'], 'pitch': ed['pitch'],
-             'created': time.time() if is_new else self.sounds[sid]['created']}
+             'created': time.time() if is_new else old['created'],
+             'folder': old.get('folder', 'My recordings'), 'kind': old.get('kind', 'hit'), 'bpm': old.get('bpm'),
+             'peaks': old.get('peaks') or self.mk_peaks(ed['data'])}
         self.prep(s)
         self.sounds[sid] = s
         self.store.save_sound(self.sounds, s, write_audio=is_new)
@@ -1211,21 +1540,34 @@ class SamplerApp(Adw.Application):
     def build_lib(self):
         page = vbox(8, 'page')
         h = hbox(8)
-        h.append(label('Library', xalign=0))
-        h.get_first_child().add_css_class('title-3')
+        self.lib_back = Gtk.Button(label='‹')
+        self.lib_back.add_css_class('back')
+        self.lib_back.connect('clicked', lambda *_: self.lib_open(None))
+        h.append(self.lib_back)
+        self.lib_title = label('Library', 'title-3', xalign=0, ellipsize=True)
+        h.append(self.lib_title)
         self.lib_count = label('', 'dim', xalign=0)
         self.lib_count.set_valign(Gtk.Align.BASELINE)
+        self.lib_count.set_hexpand(True)
         h.append(self.lib_count)
         page.append(h)
-        page.append(label('Tap a sound to hear it and pick it up. Then tap a pad to put it there. '
-                          'Swipe left to delete.', 'dim', xalign=0, wrap=True))
-        sc = Gtk.ScrolledWindow()
-        sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        sc.set_vexpand(True)
+        self.lib_tip = label('', 'dim', xalign=0, wrap=True)
+        page.append(self.lib_tip)
+        self.lib_sc = Gtk.ScrolledWindow()
+        self.lib_sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.lib_sc.set_vexpand(True)
         self.lib_list = vbox(6)
-        sc.set_child(self.lib_list)
-        page.append(sc)
+        self.lib_list.set_margin_bottom(12)
+        self.lib_sc.set_child(self.lib_list)
+        page.append(self.lib_sc)
         return page
+
+    def lib_open(self, folder):
+        self.stop_previews()
+        self.lib_folder = folder
+        self.lib_sel = None
+        self.render_lib()
+        self.lib_sc.get_vadjustment().set_value(0)
 
     def render_lib(self):
         c = self.lib_list.get_first_child()
@@ -1235,12 +1577,26 @@ class SamplerApp(Adw.Application):
             c = nx
         self.open_row = None
         self.lib_rows = {}
-        allx = sorted(self.sounds.values(), key=lambda s: -s['created'])
-        self.lib_count.set_label('%d sound%s' % (len(allx), '' if len(allx) == 1 else 's'))
-        if not allx:
-            self.lib_list.append(label('No sounds yet. Record one on the Sound tab.', 'dim'))
-        for s in allx:
-            self.lib_list.append(self.lib_row(s))
+        fs = self.folders()
+        if self.lib_folder is not None and self.lib_folder not in [f for f, _, _ in fs]:
+            self.lib_folder = None
+        if self.lib_folder is None:
+            self.lib_back.set_visible(False)
+            self.lib_title.set_label('Library')
+            self.lib_count.set_label('%d sounds' % len(self.sounds))
+            self.lib_tip.set_label('Open a folder to hear sounds and put them on pads.')
+            if not fs:
+                self.lib_list.append(label('No sounds yet. Record one on the Sound tab.', 'dim'))
+            for f, n, l in fs:
+                self.lib_list.append(self.folder_row(f, n, l, lambda f=f: self.lib_open(f)))
+        else:
+            xs = self.folder_sounds(self.lib_folder)
+            self.lib_back.set_visible(True)
+            self.lib_title.set_label(self.lib_folder)
+            self.lib_count.set_label('%d' % len(xs))
+            self.lib_tip.set_label('Tap to hear it and pick it up, then tap a pad to put it there. Swipe left to delete.')
+            for s in xs:
+                self.lib_list.append(self.lib_row(s))
         self.render_pads()
 
     def lib_row(self, s):
@@ -1270,7 +1626,7 @@ class SamplerApp(Adw.Application):
         col.set_valign(Gtk.Align.CENTER)
         col.append(label(s['name'], 'ln', xalign=0, ellipsize=True))
         on = [str(i + 1) for i, p in enumerate(self.pads) if p == sid]
-        col.append(label(fmt_s(self.sound_len(s)) + (' · Pad ' + ', '.join(on) if on else ''), 'dim', xalign=0))
+        col.append(label(self.sound_sub(s) + (' · Pad ' + ', '.join(on) if on else ''), 'dim', xalign=0))
         front.append(col)
         ed = Gtk.Button(label='Edit')
         ed.add_css_class('edit')
@@ -1341,8 +1697,14 @@ class SamplerApp(Adw.Application):
         s = self.sounds.get(sid)
         if not s:
             return
-        pk = E.peaks(s['data'], w)
-        dur = len(s['data']) / E.SR
+        if not s.get('peaks'):        # recordings made before peaks were stored
+            self.ensure(s)
+            s['peaks'] = self.mk_peaks(s['data'])
+        src = s['peaks']
+        pk = [src[min(len(src) - 1, int(x * len(src) / max(1, w)))] for x in range(w)]
+        dur = s.get('_dur')
+        if dur is None:
+            dur = s['_dur'] = (len(s['data']) / E.SR) if s.get('data') is not None else max(s['end'], 1e-6)
         a, z = s['start'] / dur * w, s['end'] / dur * w
         sel = self.lib_sel == sid
         for x in range(w):
@@ -1359,7 +1721,18 @@ class SamplerApp(Adw.Application):
         self.lib_sel = None if self.lib_sel == sid else sid
         if self.lib_sel:
             self.play_sound(sid)
-        self.render_lib()
+        else:
+            self.stop_previews()
+        # restyle rows in place (rebuilding a 120-row folder on every tap is slow on the L5)
+        for k, front in self.lib_rows.items():
+            if k == self.lib_sel:
+                front.add_css_class('sel')
+            else:
+                front.remove_css_class('sel')
+            th = front.get_first_child()
+            if th:
+                th.queue_draw()
+        self.render_pads()
 
     def lib_edit(self, sid):
         if self.open_row:
@@ -1462,7 +1835,7 @@ class SamplerApp(Adw.Application):
         if not sid or sid not in self.sounds:
             self.toast('Empty pad. Assign a sound in Library')
             return
-        self.play_sound(sid)
+        self.play_sound(sid, tag='pad%d' % i if self.is_loop(self.sounds[sid]) else None)
         p = self.pad_w[i][0]
         p.add_css_class('hit')
         GLib.timeout_add(110, lambda: p.remove_css_class('hit') or False)
@@ -1487,6 +1860,7 @@ class SamplerApp(Adw.Application):
         if self.tab == 'sound':
             self.ed_stop()
             self.rec_stop()
+        self.stop_previews()
         if t != 'lib':
             self.lib_sel = None
         self.tab = t
@@ -1546,6 +1920,8 @@ class SamplerApp(Adw.Application):
         self.sheet_rev.set_reveal_child(True)
 
     def close_sheet(self):
+        self.stop_previews()
+        self.sheet_ctx = None
         self.sheet_rev.set_reveal_child(False)
         GLib.timeout_add(200, lambda: (self.sheet_layer.set_visible(self.sheet_rev.get_reveal_child())) and False)
 
@@ -1655,7 +2031,9 @@ class SamplerApp(Adw.Application):
     def ctl_state(self):
         return {'tab': self.tab, 'playing': self.playing, 'beat': self.beat, 'dirty': self.dirty, 'sel': self.sel,
                 'pads': [self.sounds[p]['name'] if p in self.sounds else None for p in self.pads],
-                'sounds': {k: {kk: v[kk] for kk in ('name', 'start', 'end', 'vol', 'pitch')} for k, v in self.sounds.items()},
+                'sounds': {k: {kk: v.get(kk) for kk in ('name', 'start', 'end', 'vol', 'pitch', 'folder', 'kind', 'bpm')} for k, v in self.sounds.items()},
+                'lib_folder': self.lib_folder, 'folders': self.folders(), 'grid_mode': self.grid_stack.get_visible_child_name(),
+                'sheet_title': self.sheet_title.get_label(), 'voices': [v.tag for v in self.engine.voices],
                 'ed': {k: self.ed[k] for k in ('id', 'start', 'end', 'name', 'vol', 'pitch', 'dirty')},
                 'ed_len': None if self.ed['data'] is None else len(self.ed['data']) / E.SR,
                 'ed_playing': getattr(self, 'ed_playing', None), 'recording': self.recording,
@@ -1728,7 +2106,7 @@ class SamplerApp(Adw.Application):
         return h
 
     def ctl_swipe_open(self, index):
-        allx = sorted(self.sounds.values(), key=lambda s: -s['created'])
+        allx = self.folder_sounds(self.lib_folder) if self.lib_folder else sorted(self.sounds.values(), key=lambda s: -s['created'])
         front = self.lib_rows[allx[index]['id']]
         front.set_margin_end(96)
         front.get_parent().get_child().set_opacity(1)

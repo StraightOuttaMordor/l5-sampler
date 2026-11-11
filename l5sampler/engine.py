@@ -37,6 +37,26 @@ def render_sound(data, start, end, pitch):
     return seg
 
 
+def render_loop(data, start, end, steps_len, bpm):
+    """Varispeed a trimmed loop to exactly steps_len 16ths at bpm (tape-style: pitch follows tempo)."""
+    a = int(max(0.0, start) * SR)
+    b = max(a + 2, int(end * SR))
+    seg = data[a:b]
+    n = max(2, int(round(steps_len * SR * 60.0 / bpm / 4.0)))
+    x = np.linspace(0, len(seg) - 1, n)
+    out = np.interp(x, np.arange(len(seg)), seg).astype(np.float32)
+    f = min(int(0.002 * SR), n // 8)
+    if f > 0:            # tiny edge fades so the wrap point never clicks
+        ramp = np.linspace(0.0, 1.0, f, dtype=np.float32)
+        out[:f] *= ramp
+        out[-f:] *= ramp[::-1]
+    return out
+
+
+def loop_bars(seconds, bpm):
+    return max(1, int(round(seconds * bpm / 240.0)))
+
+
 def auto_trim(data):
     """Find start/end (seconds) of the audible part of a recording."""
     if len(data) == 0:
@@ -104,11 +124,12 @@ class Voice(object):
 
 class Pattern(object):
     """Immutable snapshot the UI hands to the audio thread (swap = atomic)."""
-    __slots__ = ('bpm', 'swing', 'steps', 'rows')
+    __slots__ = ('bpm', 'swing', 'steps', 'rows', 'loops')
 
-    def __init__(self, bpm=90, swing=0.0, steps=16, rows=()):
-        # rows: tuple of (buf, gain, steps_tuple)
-        self.bpm, self.swing, self.steps, self.rows = bpm, swing, steps, tuple(rows)
+    def __init__(self, bpm=90, swing=0.0, steps=16, rows=(), loops=()):
+        # rows:  tuple of (buf, gain, steps_tuple)          -> step-triggered hits
+        # loops: tuple of (key, buf, gain, len_in_16ths)    -> play continuously, phase-locked to the grid
+        self.bpm, self.swing, self.steps, self.rows, self.loops = bpm, swing, steps, tuple(rows), tuple(loops)
 
     def step_samples(self):
         return SR * 60.0 / self.bpm / 4.0
@@ -127,12 +148,15 @@ class Engine(object):
         self.seq_on = False
         self.step = 0
         self.next_grid = 0.0
+        self.steps_total = 0             # 16ths scheduled since seq_start (loop phase reference)
+        self._loops_applied = None
         self.step_log = collections.deque(maxlen=256)   # (sample, step) for the UI playhead
         self.hit_log = collections.deque(maxlen=2048)   # (sample, tag) for tests
 
     # ---- UI-thread API (all non-blocking)
-    def play(self, buf, gain=1.0, tag=None, loop=False):
-        self.cmds.append(('play', buf, gain, tag, loop))
+    def play(self, buf, gain=1.0, tag=None, loop=False, choke=False):
+        """choke=True: a new voice with this tag cuts the previous one (previews, loop pads)."""
+        self.cmds.append(('play', buf, gain, tag, loop, choke))
 
     def stop_tag(self, tag):
         self.cmds.append(('stop', tag))
@@ -157,13 +181,12 @@ class Engine(object):
     def _apply(self, c):
         k = c[0]
         if k == 'play':
-            _, buf, gain, tag, loop = c
-            if tag is not None and tag.startswith('preview'):
+            _, buf, gain, tag, loop, choke = c
+            if tag is not None and (choke or tag.startswith('preview')):
                 self.voices = [v for v in self.voices if v.tag != tag]
             self.voices.append(Voice(buf, gain, 0, loop, tag))
             self.hit_log.append((self.t, tag))
-            if len(self.voices) > MAX_VOICES:
-                self.voices = self.voices[-MAX_VOICES:]
+            self._cap()
         elif k == 'stop':
             self.voices = [v for v in self.voices if v.tag != c[1]]
         elif k == 'update':
@@ -175,10 +198,46 @@ class Engine(object):
                         v.pos = v.pos % len(buf) if v.loop else len(buf)
         elif k == 'seq_start':
             self.seq_on, self.step, self.next_grid = True, 0, float(self.t)
+            self.steps_total = 0
+            self._loops_applied = None
+            self.voices = [v for v in self.voices if not (v.tag == 'seq' or (v.tag or '').startswith('loop:'))]
             self.step_log.clear()
         elif k == 'seq_stop':
             self.seq_on = False
-            self.voices = [v for v in self.voices if v.tag != 'seq']
+            self.voices = [v for v in self.voices if not (v.tag == 'seq' or (v.tag or '').startswith('loop:'))]
+
+    def _cap(self):
+        """Voice limit; never steals the backing loops."""
+        if len(self.voices) > MAX_VOICES:
+            loops = [v for v in self.voices if (v.tag or '').startswith('loop:')]
+            rest = [v for v in self.voices if not (v.tag or '').startswith('loop:')]
+            self.voices = loops + rest[-(MAX_VOICES - len(loops)):]
+
+    def loop_phase(self, p):
+        """Current grid position in 16ths (float) at sample self.t."""
+        return self.steps_total - (self.next_grid - self.t) / p.step_samples()
+
+    def _sync_loops(self, p):
+        """(Re)align backing-loop voices to the grid after start / pattern swap (BPM change, loop added)."""
+        sp = self.loop_phase(p)
+        have = {v.tag: v for v in self.voices if (v.tag or '').startswith('loop:')}
+        keep = [v for v in self.voices if not (v.tag or '').startswith('loop:')]
+        for key, buf, gain, lsteps in p.loops:
+            tag = 'loop:' + key
+            L = len(buf)
+            if L == 0:
+                continue
+            pos = int((sp % lsteps) / lsteps * L) % L
+            v = have.get(tag)
+            if v is None:
+                v = Voice(buf, gain, 0, True, tag)
+                v.pos = pos
+            else:
+                if v.buf is not buf:
+                    v.buf, v.pos = buf, pos
+                v.gain = gain
+            keep.append(v)
+        self.voices = keep
 
     def render(self, frames):
         while self.cmds:
@@ -187,6 +246,9 @@ class Engine(object):
         end = self.t + frames
         if self.seq_on:
             p = self.pattern
+            if self._loops_applied is not p:
+                self._sync_loops(p)
+                self._loops_applied = p
             sd = p.step_samples()
             n = p.steps
             while True:
@@ -202,9 +264,9 @@ class Engine(object):
                 self.step_log.append((self.t + off, self.step))
                 self.hit_log.append((self.t + off, 'step%d' % self.step))
                 self.next_grid += sd
+                self.steps_total += 1
                 self.step = (self.step + 1) % n
-            if len(self.voices) > MAX_VOICES:
-                self.voices = self.voices[-MAX_VOICES:]
+            self._cap()
         keep = []
         for v in self.voices:
             d = v.delay

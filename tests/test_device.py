@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """On-device UI test: drives the running app over its control socket."""
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -55,9 +56,18 @@ time.sleep(0.5)
 s = st()
 ok('boot: 3 tabs, beat home, 16 cells', s['tab'] == 'beat' and s['cells'] == 16)
 ok('seed pads', s['pads'] == ['Kick', 'Snare', 'Hat', 'Clap'], s['pads'])
-ok('seed beat 3 rows', len(s['beat']['rows']) == 3)
+ok('first launch: EMPTY beat (no background pattern)', len(s['beat']['rows']) == 0 and not s['playing'])
 ok('audio up, latency <= 40 ms', s['audio_err'] is None and s['latency_ms'] <= 40, '%.1f ms' % s['latency_ms'])
 x0 = s['xruns']
+shot('00-empty-beat')
+
+# build the old starter pattern by hand through the browser
+kit = {v['name']: k for k, v in s['sounds'].items() if v['folder'] == 'Starter kit'}
+for nm, idx in (('Kick', [0, 8, 10]), ('Snare', [4, 12]), ('Hat', [0, 2, 4, 6, 8, 10, 12, 14])):
+    call('add_row', kit[nm])
+    for k in idx:
+        call('tap_cell', k)
+ok('built 3-row beat', len(st()['beat']['rows']) == 3)
 shot('01-beat')
 
 # timing on device: run 3 s, measure step spacing in samples
@@ -147,11 +157,18 @@ ctl('set', widget='pit_s', value=5)
 ok('pitch set', st()['ed']['pitch'] == 5)
 call('ed_save')
 s = st()
-ok('saved to library', s['ed']['id'] is not None and not s['ed']['dirty'] and len(s['sounds']) == 5)
+N0 = len(s['sounds'])
+ok('saved to library (My recordings)', s['ed']['id'] is not None and not s['ed']['dirty']
+   and s['sounds'][s['ed']['id']]['folder'] == 'My recordings')
 shot('08-saved')
 
-# library assign to pad
+# library: folders first, then sounds
 call('set_tab', 'lib')
+s2 = st()
+names = [f[0] for f in s2['folders']]
+ok('library opens on folders, My recordings first', s2['lib_folder'] is None and names[0] == 'My recordings', names[:4])
+shot('09a-lib-folders')
+call('lib_open', 'My recordings')
 new_id = s['ed']['id']
 call('lib_tap', new_id)
 ok('library select -> assign mode', st()['lib_sel'] == new_id)
@@ -161,7 +178,8 @@ s = st()
 newname = s['sounds'][new_id]['name']
 ok('pad 2 = new sound', s['pads'][1] == newname, s['pads'])
 
-# swipe + delete with confirm
+# swipe + delete with confirm (inside Starter kit folder)
+call('lib_open', 'Starter kit')
 nm = ctl('swipe_open', index=1)
 shot('10-swiped')
 victim = [k for k, v in s['sounds'].items() if v['name'] == nm][0]
@@ -171,12 +189,59 @@ ok('"are you sure" dialog up', st()['dialog'])
 shot('11-confirm')
 ctl('dialog', response='cancel')
 time.sleep(0.3)
-ok('cancel keeps it', len(st()['sounds']) == 5)
+ok('cancel keeps it', len(st()['sounds']) == N0)
 call('delete_sound', victim)
 time.sleep(0.4)
 ctl('dialog', response='ok')
 time.sleep(0.3)
-ok('delete removes it', len(st()['sounds']) == 4, nm)
+ok('delete removes it', len(st()['sounds']) == N0 - 1, nm)
+
+# ---- step long-press sheet: every sound on that step, toggle live
+call('set_tab', 'beat')
+call('hold_cell', 0)
+time.sleep(0.4)
+s = st()
+ok('long-press opens step sheet', s['sheet'] and s['sheet_title'].startswith('Beat 1'), s['sheet_title'])
+shot('13-step-sheet')
+call('close_sheet')
+
+# ---- imported library: loops lock to the beat
+s = st()
+loops = {k: v for k, v in s['sounds'].items() if v['kind'] == 'loop'}
+if loops:
+    lid, lv = sorted(loops.items(), key=lambda kv: (kv[1]['folder'], kv[1]['name']))[0]
+    call('new_beat'); time.sleep(0.3)
+    if st()['dialog']:
+        ctl('dialog', response='ok'); time.sleep(0.3)
+    call('add_row', lid)
+    s = st()
+    ok('loop row added; beat adopts loop BPM', s['beat']['rows'][0].get('loop') and (not lv['bpm'] or s['beat']['bpm'] == lv['bpm']),
+       (lv['folder'], lv['name'], lv['bpm'], s['beat']['bpm']))
+    ok('loop row shows loop card, not grid', s['grid_mode'] == 'loop')
+    shot('14-loop-card')
+    x3 = st()['xruns']
+    call('start_beat'); time.sleep(4)
+    s = st()
+    ok('loop voice running with the beat', any((v or '').startswith('loop:') for v in s['voices']), s['voices'][:4])
+    print('xruns during 4 s of loop playback: +%d' % (s['xruns'] - x3))
+    call('bpm_by', 7); time.sleep(1)
+    ok('BPM change keeps loop playing', any((v or '').startswith('loop:') for v in st()['voices']))
+    call('stop_beat')
+    ok('stop beat silences loop', not any((v or '').startswith('loop:') for v in st()['voices']))
+    # browser: folder list -> folder contents
+    call('open_add_sound'); time.sleep(0.3)
+    ok('add-sound sheet shows folders', st()['sheet_title'] == 'Add a sound to the beat')
+    shot('15-add-folders')
+    call('open_browser', {'mode': 'add'}, lv['folder']); time.sleep(0.4)
+    ok('folder opens in sheet', st()['sheet_title'] == lv['folder'])
+    shot('16-add-folder-open')
+    call('close_sheet')
+    call('set_tab', 'lib'); call('lib_open', lv['folder']); time.sleep(0.6)
+    shot('17-lib-loop-folder')
+    call('lib_open', None)
+    call('set_tab', 'beat')
+else:
+    print('(no imported loops in this library; loop tests skipped)')
 
 # beats sheet: save + export
 call('set_tab', 'beat')

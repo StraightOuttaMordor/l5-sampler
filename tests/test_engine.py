@@ -115,5 +115,69 @@ E.write_wav(fn, y, stereo=True)
 y2 = E.read_wav(fn)
 ok('wav roundtrip', len(y2) == len(y) and np.abs(y2 - y).max() < 1e-3)
 
+# ---- backing loops: phase-locked to the grid, re-stretched on BPM change
+mk = lambda n: (np.arange(n, dtype=np.float32) / n)          # ramp: position == phase
+raw = mk(E.SR * 2)                                            # 2 s @120 BPM = 1 bar
+lb = E.render_loop(raw, 0, 2.0, 16, 120)
+ok('render_loop exact length @120', len(lb) == int(round(16 * E.SR * 60 / 120 / 4)), len(lb))
+lb90 = E.render_loop(raw, 0, 2.0, 16, 90)
+ok('render_loop stretches to 90 BPM', len(lb90) == int(round(16 * E.SR * 60 / 90 / 4)), len(lb90))
+ok('loop_bars', E.loop_bars(2.0, 120) == 1 and E.loop_bars(8.0, 120) == 4 and E.loop_bars(3.9, 115) == 2)
+
+e = E.Engine()
+e.pattern = E.Pattern(120, 0, 16, [], [('L', lb, 1.0, 16)])
+e.seq_start()
+y = np.concatenate([e.render(512) for _ in range(int(E.SR * 4.5 / 512))])
+ok('loop starts with the beat at phase 0', np.abs(y[:200]).max() < 0.05)
+ok('loop wraps exactly every bar', abs(y[E.SR * 2 + 5000] - y[5000]) < 1e-3 and abs(y[E.SR * 4 + 5000] - y[5000]) < 1e-3)
+# swap pattern mid-bar (e.g. hit added): loop must keep its phase, not restart
+e = E.Engine()
+p1 = E.Pattern(120, 0, 16, [], [('L', lb, 1.0, 16)])
+e.pattern = p1
+e.seq_start()
+for _ in range(60):
+    e.render(512)                                  # ~0.64 s into the bar
+pos_before = [v.pos for v in e.voices if v.tag == 'loop:L'][0]
+e.pattern = E.Pattern(120, 0, 16, [(click, 1.0, tuple([1] * 16))], [('L', lb, 1.0, 16)])
+e.render(512)
+pos_after = [v.pos for v in e.voices if v.tag == 'loop:L'][0]
+ok('pattern swap keeps loop phase', 0 < pos_after - pos_before <= 512 + 2, (pos_before, pos_after))
+# BPM change mid-bar: loop re-stretched AND lands at the same musical position
+for _ in range(30):
+    e.render(512)
+ph = e.loop_phase(e.pattern) % 16 / 16
+e.pattern = E.Pattern(90, 0, 16, [], [('L', lb90, 1.0, 16)])
+e.render(1)
+v = [v for v in e.voices if v.tag == 'loop:L'][0]
+ok('BPM change re-stretches + keeps bar position', v.buf is lb90 and abs(v.pos / len(lb90) - ph) < 0.01,
+   (round(v.pos / len(lb90), 4), round(ph, 4)))
+# removing the loop from the pattern stops it
+e.pattern = E.Pattern(90, 0, 16, [], [])
+e.render(512)
+ok('removed loop stops', not any(v.tag == 'loop:L' for v in e.voices))
+# loops never stolen by the voice cap
+e = E.Engine()
+e.pattern = E.Pattern(120, 0, 16, [], [('L', lb, 1.0, 16)])
+e.seq_start()
+e.render(64)
+for _ in range(80):
+    e.play(click, 1.0)
+e.render(64)
+ok('voice cap never steals the loop', any(v.tag == 'loop:L' for v in e.voices) and len(e.voices) <= E.MAX_VOICES)
+# choke: re-tapping a loop pad restarts instead of stacking
+e = E.Engine()
+for _ in range(3):
+    e.play(lb, 1.0, tag='pad0', choke=True)
+    e.render(256)
+ok('choke: one voice per pad', sum(1 for v in e.voices if v.tag == 'pad0') == 1)
+# seq_stop kills loops
+e = E.Engine()
+e.pattern = E.Pattern(120, 0, 16, [], [('L', lb, 1.0, 16)])
+e.seq_start(); e.render(256); e.seq_stop(); e.render(256)
+ok('stop beat stops loops', not any((v.tag or '').startswith('loop:') for v in e.voices))
+# export includes the loop, bar-exact
+y = E.offline_render(E.Pattern(120, 0, 16, [], [('L', lb, 1.0, 16)]), loops=2)
+ok('export renders loop, exact length', len(y) == E.SR * 4 and np.abs(y).max() > 0.3)
+
 print('\n%d/%d passed' % (sum(R), len(R)))
 sys.exit(0 if all(R) else 1)
