@@ -1094,7 +1094,7 @@ class SamplerApp(Adw.Application):
             col.set_valign(Gtk.Align.CENTER)
             col.append(label(bt['name'], 't', xalign=0, ellipsize=True))
             col.append(label('%d BPM · %d/4 · %d sounds' % (bt['bpm'], bt['meter'], len(bt['rows'])), 'dim', xalign=0))
-            on_press(col, lambda bt=bt: self.load_beat(bt))
+            on_tap(col, lambda bt=bt: self.load_beat(bt))
             it.append(col)
             x = Gtk.Button(label='✕')
             x.add_css_class('x')
