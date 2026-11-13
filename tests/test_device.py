@@ -54,7 +54,7 @@ def shot(n):
 SR = 48000
 time.sleep(0.5)
 s = st()
-ok('boot: 3 tabs, beat home, 16 cells', s['tab'] == 'beat' and s['cells'] == 16)
+ok('boot: beat home, 16 cells', s['tab'] == 'beat' and s['cells'] == 16)
 ok('seed pads', s['pads'] == ['Kick', 'Snare', 'Hat', 'Clap'], s['pads'])
 ok('first launch: EMPTY beat (no background pattern)', len(s['beat']['rows']) == 0 and not s['playing'])
 ok('audio up, latency <= 40 ms', s['audio_err'] is None and s['latency_ms'] <= 40, '%.1f ms' % s['latency_ms'])
@@ -162,13 +162,18 @@ ok('saved to library (My recordings)', s['ed']['id'] is not None and not s['ed']
    and s['sounds'][s['ed']['id']]['folder'] == 'My recordings')
 shot('08-saved')
 
-# library: folders first, then sounds
-call('set_tab', 'lib')
+# MINE tab: straight to the recordings list, no folders
+call('set_tab', 'mine')
 s2 = st()
-names = [f[0] for f in s2['folders']]
-ok('library opens on folders, My recordings first', s2['lib_folder'] is None and names[0] == 'My recordings', names[:4])
-shot('09a-lib-folders')
-call('lib_open', 'My recordings')
+ok('MINE tab opens straight on My recordings', s2['lib_folder'] == 'My recordings' and s2['lib_title'] == 'My recordings')
+shot('09a-mine')
+# KITS tab: built-in folders only, never My recordings
+call('set_tab', 'kits')
+s2 = st()
+ok('KITS tab lists kit folders, not My recordings', s2['lib_folder'] is None and s2['lib_title'] == 'Kits'
+   and 'My recordings' not in [r for r in ctl('call', name='kit_names', args=[])], ctl('call', name='kit_names', args=[])[:5])
+shot('09b-kits')
+call('set_tab', 'mine')
 new_id = s['ed']['id']
 call('lib_tap', new_id)
 ok('library select -> assign mode', st()['lib_sel'] == new_id)
@@ -178,7 +183,8 @@ s = st()
 newname = s['sounds'][new_id]['name']
 ok('pad 2 = new sound', s['pads'][1] == newname, s['pads'])
 
-# swipe + delete with confirm (inside Starter kit folder)
+# swipe + delete with confirm (inside Starter kit folder, on KITS)
+call('set_tab', 'kits')
 call('lib_open', 'Starter kit')
 nm = ctl('swipe_open', index=1)
 shot('10-swiped')
@@ -236,12 +242,56 @@ if loops:
     ok('folder opens in sheet', st()['sheet_title'] == lv['folder'])
     shot('16-add-folder-open')
     call('close_sheet')
-    call('set_tab', 'lib'); call('lib_open', lv['folder']); time.sleep(0.6)
+    call('set_tab', 'kits'); call('lib_open', lv['folder']); time.sleep(0.6)
     shot('17-lib-loop-folder')
     call('lib_open', None)
     call('set_tab', 'beat')
 else:
     print('(no imported loops in this library; loop tests skipped)')
+
+# ---- add-sound sheet: pad strip on top, tap a pad to use its sound
+call('set_tab', 'beat')
+call('open_add_sound'); time.sleep(0.4)
+s = st()
+ok('add-sound sheet shows the 4 pads on top', s['pick_btns'] is not None and len(s['pick_btns']) == 4, s['pick_btns'])
+shot('18-add-pads')
+usable = [i for i, u in s['pick_btns'] if u]
+if usable:
+    n0 = len(s['beat']['rows'])
+    pid = ctl('call', name='pad_sid', args=[usable[0]])
+    ctl('call', name='browser_pick', args=[pid]); time.sleep(0.3)
+    s = st()
+    ok('tapping a pad adds its sound to the beat', len(s['beat']['rows']) == n0 + 1 and s['beat']['rows'][-1]['soundId'] == pid)
+call('close_sheet')
+# step sheet route: the pad strip also appears when adding to a single step
+call('open_browser', {'mode': 'step', 'k': 3}); time.sleep(0.3)
+ok('step picker also shows the pad strip', st()['pick_btns'] is not None)
+call('close_sheet')
+
+# ---- preset beats (only when the electronic kits + presets are installed)
+pre = [n for n, p in st()['beats'] if p]
+if pre:
+    ok('10 preset beats listed', len(pre) == 10, pre)
+    call('new_beat'); time.sleep(0.3)
+    if st()['dialog']:
+        ctl('dialog', response='ok'); time.sleep(0.3)
+    call('open_beats'); time.sleep(0.4)
+    shot('19-beats-presets')
+    ctl('call', name='load_preset', args=[pre[0]]); time.sleep(0.4)
+    if st()['dialog']:
+        ctl('dialog', response='ok'); time.sleep(0.3)
+    s = st()
+    ok('preset loads with its sounds', s['beat']['name'] == pre[0] and len(s['beat']['rows']) >= 4, (s['beat']['name'], len(s['beat']['rows'])))
+    shot('20-preset-loaded')
+    ctl('hits', clear=True)
+    xp = st()['xruns']
+    call('start_beat'); time.sleep(3)
+    shot('21-preset-playing')
+    nh = len([t for _, t in ctl('hits') if t and t.startswith('step')])
+    ok('preset plays', nh > 20, '%d steps, xruns +%d' % (nh, st()['xruns'] - xp))
+    call('stop_beat')
+else:
+    print('(no presets installed; preset tests skipped)')
 
 # beats sheet: save + export
 call('set_tab', 'beat')

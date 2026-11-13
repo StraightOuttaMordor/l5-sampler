@@ -1,6 +1,7 @@
 """L5 Sampler: native GTK4 / libadwaita app for the Librem 5.
 
-Three tabs (BEAT / SOUND / LIBRARY), 4 pads always on screen, offline.
+Four tabs (BEAT / SOUND / KITS / MINE), 4 pads always on screen, offline.
+KITS = built-in sample folders, MINE = your own recordings.
 """
 import json
 import os
@@ -25,6 +26,8 @@ COLORS = ['#ff5a1f', '#2f6bff', '#141414', '#d9a000', '#00a676', '#a64dff', '#e0
 COUNT = ['', 'e', '&', 'a']
 EXPORT_DIR = os.path.expanduser('~/Music/L5-Sampler')
 MAX_REC_S = 10.0
+MINE = 'My recordings'          # the one folder that holds the user's own recordings
+LIB_TABS = ('kits', 'mine')     # both show the library page, scoped to built-in kits or recordings
 
 CSS = """
 window, .root { background: #ebe8e1; color: #141414; }
@@ -105,6 +108,12 @@ button.edit { background: transparent; background-image: none; box-shadow: none;
 .shitem.cur { box-shadow: inset 0 0 0 2px #ff5a1f; }
 .shitem.dis { opacity: 0.4; }
 .shitem .t { font-weight: 800; }
+button.padpick, button.padpick:hover { background: #141414; background-image: none; box-shadow: none; border: none;
+  border-radius: 12px; min-height: 52px; padding: 4px 8px; color: #fff; }
+button.padpick:disabled { background: #f7f5f0; color: #8a857b; border: 1.5px dashed #d3cec4; }
+button.padpick:disabled .pn { color: #8a857b; }
+.padpick .pn { font-size: 10px; font-weight: 800; letter-spacing: 1px; color: rgba(255,255,255,0.7); }
+.padpick .ps { font-size: 12px; font-weight: 800; }
 button.x { background: transparent; background-image: none; box-shadow: none; border: none; color: #d92d20; font-weight: 800; font-size: 18px; min-width: 42px; }
 """ + ''.join('.c%d, .cell.on.c%d { background: %s; }\n' % (i, i, c) for i, c in enumerate(COLORS))
 
@@ -242,6 +251,7 @@ class SamplerApp(Adw.Application):
         self.tab = 'beat'
         self.lib_sel = None
         self.lib_folder = None
+        self.kits_folder = None         # remembered folder on the Kits tab
         self.sheet_ctx = None
         self.playing = False
         self.cur_step = -1
@@ -915,11 +925,11 @@ class SamplerApp(Adw.Application):
         """[(name, count, n_loops)] sorted: My recordings, Starter kit, then hits A-Z, then loop folders A-Z."""
         agg = {}
         for s in self.sounds.values():
-            f = s.get('folder') or 'My recordings'
+            f = s.get('folder') or MINE
             a = agg.setdefault(f, [0, 0])
             a[0] += 1
             a[1] += 1 if self.is_loop(s) else 0
-        pin = {'My recordings': 0, 'Starter kit': 1}
+        pin = {MINE: 0, 'Starter kit': 1}
 
         def key(f):
             n, l = agg[f]
@@ -927,8 +937,8 @@ class SamplerApp(Adw.Application):
         return [(f, agg[f][0], agg[f][1]) for f in sorted(agg, key=key)]
 
     def folder_sounds(self, folder):
-        xs = [s for s in self.sounds.values() if (s.get('folder') or 'My recordings') == folder]
-        if folder == 'My recordings':
+        xs = [s for s in self.sounds.values() if (s.get('folder') or MINE) == folder]
+        if folder == MINE:
             return sorted(xs, key=lambda s: -s['created'])
         return sorted(xs, key=lambda s: s['name'].lower())
 
@@ -952,9 +962,7 @@ class SamplerApp(Adw.Application):
         body = vbox(6)
         used = set(r['soundId'] for r in self.beat['rows'])
         if folder is None:
-            if ctx['mode'] == 'add':
-                body.append(label('Sounds go on the step grid. Loops play the whole time, locked to the tempo.',
-                                  'dim', xalign=0, wrap=True))
+            self.append_pad_picks(body, ctx, used)
             for f, n, l in self.folders():
                 if ctx['mode'] == 'step' and l == n:
                     continue                      # loops can't sit on a single step
@@ -997,6 +1005,35 @@ class SamplerApp(Adw.Application):
                 body.append(it)
             title = folder
         self.open_sheet(title, body)
+
+    def append_pad_picks(self, body, ctx, used):
+        """Top of the pick-a-sound sheet: the 4 pads, tap one to use its sound."""
+        pads = [(i, self.sounds.get(p) if p else None) for i, p in enumerate(self.pads)]
+        if not any(s for _, s in pads):
+            return
+        body.append(label('FROM YOUR PADS', 'lbl', xalign=0))
+        strip = hbox(6)
+        strip.set_homogeneous(True)
+        self.pick_btns = []
+        for i, s in pads:
+            b = Gtk.Button()
+            b.add_css_class('padpick')
+            col = vbox(0)
+            col.append(label('PAD %d' % (i + 1), 'pn', xalign=0))
+            usable = bool(s) and not (ctx['mode'] == 'step' and self.is_loop(s)) \
+                and not (ctx['mode'] == 'add' and s['id'] in used)
+            why = 'empty' if not s else s['name'] if usable else 'in beat' if s['id'] in used else 'loop'
+            col.append(label(why, 'ps', xalign=0, ellipsize=True))
+            b.set_child(col)
+            b.set_sensitive(usable)
+            if usable:
+                b.connect('clicked', lambda *_, sid=s['id']: self.browser_pick(sid))
+            strip.append(b)
+            self.pick_btns.append((i, usable))
+        body.append(strip)
+        lb = label('OR PICK FROM A FOLDER', 'lbl', xalign=0)
+        lb.set_margin_top(6)
+        body.append(lb)
 
     def sound_sub(self, s):
         if self.is_loop(s):
@@ -1093,7 +1130,8 @@ class SamplerApp(Adw.Application):
             col.set_hexpand(True)
             col.set_valign(Gtk.Align.CENTER)
             col.append(label(bt['name'], 't', xalign=0, ellipsize=True))
-            col.append(label('%d BPM · %d/4 · %d sounds' % (bt['bpm'], bt['meter'], len(bt['rows'])), 'dim', xalign=0))
+            col.append(label('%s%d BPM · %d sounds' % ('Preset · ' if bt.get('preset') else '', bt['bpm'], len(bt['rows'])),
+                             'dim', xalign=0))
             on_tap(col, lambda bt=bt: self.load_beat(bt))
             it.append(col)
             x = Gtk.Button(label='✕')
@@ -1123,6 +1161,8 @@ class SamplerApp(Adw.Application):
             self.stop_beat()
             self.beat = json.loads(json.dumps(bt))
             self.beat.pop('saved', None)
+            if self.beat.pop('preset', False):
+                self.beat['id'] = None        # a preset is a starting point: Save makes your own copy, the preset stays
             self.clean_beat()
             self.sel = 0
             self.dirty = False
@@ -1585,6 +1625,8 @@ class SamplerApp(Adw.Application):
 
     def lib_open(self, folder):
         self.stop_previews()
+        if self.tab == 'mine':
+            folder = MINE
         self.lib_folder = folder
         self.lib_sel = None
         self.render_lib()
@@ -1598,24 +1640,32 @@ class SamplerApp(Adw.Application):
             c = nx
         self.open_row = None
         self.lib_rows = {}
-        fs = self.folders()
-        if self.lib_folder is not None and self.lib_folder not in [f for f, _, _ in fs]:
+        mine = self.tab == 'mine'
+        fs = [f for f in self.folders() if f[0] != MINE]          # Kits tab: built-in folders only
+        if mine:
+            self.lib_folder = MINE
+        elif self.lib_folder is not None and self.lib_folder not in [f for f, _, _ in fs]:
             self.lib_folder = None
         if self.lib_folder is None:
             self.lib_back.set_visible(False)
-            self.lib_title.set_label('Library')
-            self.lib_count.set_label('%d sounds' % len(self.sounds))
-            self.lib_tip.set_label('Open a folder to hear sounds and put them on pads.')
+            self.lib_title.set_label('Kits')
+            self.lib_count.set_label('%d sounds' % sum(n for _, n, _ in fs))
+            self.lib_tip.set_label('Open a kit to hear sounds and put them on pads.')
             if not fs:
-                self.lib_list.append(label('No sounds yet. Record one on the Sound tab.', 'dim'))
+                self.lib_list.append(label('No kits installed.', 'dim'))
             for f, n, l in fs:
                 self.lib_list.append(self.folder_row(f, n, l, lambda f=f: self.lib_open(f)))
         else:
             xs = self.folder_sounds(self.lib_folder)
-            self.lib_back.set_visible(True)
-            self.lib_title.set_label(self.lib_folder)
+            self.lib_back.set_visible(not mine)
+            self.lib_title.set_label('My recordings' if mine else self.lib_folder)
             self.lib_count.set_label('%d' % len(xs))
-            self.lib_tip.set_label('Tap to hear it and pick it up, then tap a pad to put it there. Swipe left to delete.')
+            if mine and not xs:
+                self.lib_tip.set_label('')
+                self.lib_list.append(label('No recordings yet. Record one on the Sound tab and save it, and it lands here.',
+                                           'dim', xalign=0, wrap=True))
+            else:
+                self.lib_tip.set_label('Tap to hear it and pick it up, then tap a pad to put it there. Swipe left to delete.')
             for s in xs:
                 self.lib_list.append(self.lib_row(s))
         self.render_pads()
@@ -1827,7 +1877,7 @@ class SamplerApp(Adw.Application):
         return box
 
     def render_pads(self):
-        assigning = self.tab == 'lib' and self.lib_sel is not None
+        assigning = self.tab in LIB_TABS and self.lib_sel is not None
         for i, (p, pn, ps) in enumerate(self.pad_w):
             sid = self.pads[i]
             s = self.sounds.get(sid) if sid else None
@@ -1844,7 +1894,7 @@ class SamplerApp(Adw.Application):
         self.pad_hint.set_reveal_child(assigning)
 
     def pad_down(self, i):
-        if self.tab == 'lib' and self.lib_sel:
+        if self.tab in LIB_TABS and self.lib_sel:
             self.pads[i] = self.lib_sel
             n = self.sounds[self.lib_sel]['name']
             self.lib_sel = None
@@ -1854,7 +1904,7 @@ class SamplerApp(Adw.Application):
             return
         sid = self.pads[i]
         if not sid or sid not in self.sounds:
-            self.toast('Empty pad. Assign a sound in Library')
+            self.toast('Empty pad. Assign a sound from Kits or Mine')
             return
         self.play_sound(sid, tag='pad%d' % i if self.is_loop(self.sounds[sid]) else None)
         p = self.pad_w[i][0]
@@ -1865,7 +1915,7 @@ class SamplerApp(Adw.Application):
         bar = hbox(0, 'tabbar')
         bar.set_homogeneous(True)
         self.tab_b = {}
-        for key, txt in (('beat', 'BEAT'), ('sound', 'SOUND'), ('lib', 'LIBRARY')):
+        for key, txt in (('beat', 'BEAT'), ('sound', 'SOUND'), ('kits', 'KITS'), ('mine', 'MINE')):
             b = Gtk.Button(label=txt)
             b.connect('clicked', lambda *_, k=key: self.set_tab(k))
             bar.append(b)
@@ -1882,12 +1932,17 @@ class SamplerApp(Adw.Application):
             self.ed_stop()
             self.rec_stop()
         self.stop_previews()
-        if t != 'lib':
-            self.lib_sel = None
+        self.lib_sel = None
+        if self.tab == 'kits':
+            self.kits_folder = self.lib_folder
+        if t == 'kits':
+            self.lib_folder = self.kits_folder
+        elif t == 'mine':
+            self.lib_folder = MINE
         self.tab = t
         if self._toast:
             self._toast.dismiss()
-        self.stack.set_visible_child_name(t)
+        self.stack.set_visible_child_name('lib' if t in LIB_TABS else t)
         for k, b in self.tab_b.items():
             if k == t:
                 b.add_css_class('on')
@@ -2053,7 +2108,8 @@ class SamplerApp(Adw.Application):
         return {'tab': self.tab, 'playing': self.playing, 'beat': self.beat, 'dirty': self.dirty, 'sel': self.sel,
                 'pads': [self.sounds[p]['name'] if p in self.sounds else None for p in self.pads],
                 'sounds': {k: {kk: v.get(kk) for kk in ('name', 'start', 'end', 'vol', 'pitch', 'folder', 'kind', 'bpm')} for k, v in self.sounds.items()},
-                'lib_folder': self.lib_folder, 'folders': self.folders(), 'grid_mode': self.grid_stack.get_visible_child_name(),
+                'lib_folder': self.lib_folder, 'folders': self.folders(), 'lib_title': self.lib_title.get_label(),
+                'pick_btns': getattr(self, 'pick_btns', None), 'beats': [(b['name'], b.get('preset', False)) for b in self.beats], 'grid_mode': self.grid_stack.get_visible_child_name(),
                 'sheet_title': self.sheet_title.get_label(), 'voices': [v.tag for v in self.engine.voices],
                 'ed': {k: self.ed[k] for k in ('id', 'start', 'end', 'name', 'vol', 'pitch', 'dirty')},
                 'ed_len': None if self.ed['data'] is None else len(self.ed['data']) / E.SR,
@@ -2125,6 +2181,18 @@ class SamplerApp(Adw.Application):
         if clear:
             self.engine.hit_log.clear()
         return h
+
+    # test helpers (called via ctl 'call')
+    def kit_names(self):
+        return [f for f, _, _ in self.folders() if f != MINE]
+
+    def pad_sid(self, i):
+        return self.pads[i]
+
+    def load_preset(self, name):
+        bt = next(b for b in self.beats if b['name'] == name)
+        self.load_beat(bt)
+        return bt['id']
 
     def ctl_swipe_open(self, index):
         allx = self.folder_sounds(self.lib_folder) if self.lib_folder else sorted(self.sounds.values(), key=lambda s: -s['created'])
