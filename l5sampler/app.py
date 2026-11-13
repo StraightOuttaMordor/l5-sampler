@@ -158,6 +158,27 @@ def on_press(widget, cb, release=None):
     return g
 
 
+def on_tap(widget, cb, slop=10):
+    """Fire on RELEASE, only if the finger didn't travel: for rows inside scrolling lists,
+    so a touch that starts a scroll never counts as a tap. (Instruments use on_press.)"""
+    st = {'xy': None}
+
+    def pressed(g, n, x, y):
+        st['xy'] = (x, y)
+
+    def released(g, n, x, y):
+        xy, st['xy'] = st['xy'], None
+        if xy and abs(x - xy[0]) <= slop and abs(y - xy[1]) <= slop:
+            cb()
+    g = Gtk.GestureClick()
+    g.connect('pressed', pressed)
+    g.connect('released', released)
+    g.connect('stopped', lambda g: st.update(xy=None))    # scroller took the touch
+    g.connect('cancel', lambda g, seq: st.update(xy=None))
+    widget.add_controller(g)
+    return g
+
+
 def on_tap_or_hold(widget, tap, hold, hold_s=0.45):
     """Tap fires on touch-DOWN (instant, like a pad); holding past hold_s also fires `hold`.
 
@@ -911,7 +932,7 @@ class SamplerApp(Adw.Application):
             return sorted(xs, key=lambda s: -s['created'])
         return sorted(xs, key=lambda s: s['name'].lower())
 
-    def folder_row(self, name, count, loops, on_tap):
+    def folder_row(self, name, count, loops, on_tap_cb):
         it = hbox(10, 'folder')
         col = vbox(1)
         col.set_hexpand(True)
@@ -922,7 +943,7 @@ class SamplerApp(Adw.Application):
         col.append(label(what, 'dim', xalign=0))
         it.append(col)
         it.append(label('›', 'crumb'))
-        on_press(it, on_tap)
+        on_tap(it, on_tap_cb)
         return it
 
     def open_browser(self, ctx, folder=None):
